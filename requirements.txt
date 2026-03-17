@@ -1,0 +1,6 @@
+python-telegram-bot>=22.6,<23
+google-genai>=0.2.0
+google-api-python-client>=2.128.0
+google-auth>=2.29.0
+google-auth-oauthlib>=1.2.0
+aiosqlite>=0.20.0
