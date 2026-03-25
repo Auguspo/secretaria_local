@@ -25,10 +25,19 @@ def _ensure_credentials() -> Credentials:
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                # Token revocado/expirado sin recuperacion: fuerza nuevo login OAuth.
+                creds = None
+                if os.path.exists(CALENDAR_TOKEN_PATH):
+                    try:
+                        os.remove(CALENDAR_TOKEN_PATH)
+                    except OSError:
+                        pass
+        if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=8080, open_browser=False)
+            creds = flow.run_local_server(port=8080, open_browser=True)
         with open(CALENDAR_TOKEN_PATH, "w", encoding="utf-8") as token:
             token.write(creds.to_json())
     return creds
