@@ -124,6 +124,17 @@ async def cambiar_estado_tarea_suelta(tarea_id: int, estado: str) -> None:
         await db.commit()
 
 
+async def completar_todas_tareas_pendientes() -> int:
+    """Marca como completadas todas las tareas pendientes y devuelve cantidad afectada."""
+    await init_db()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE tareas_sueltas SET estado = 'Completada' WHERE estado = 'Pendiente'"
+        )
+        await db.commit()
+        return int(cursor.rowcount or 0)
+
+
 async def vincular_tarea_suelta(
     tarea_id: int,
     *,

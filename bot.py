@@ -1,20 +1,17 @@
 import datetime
+from scheduler import job_reporte_diario, job_nudge_objetivos
 import logging
 import random
 import re
-from collections import deque
 from typing import Any, Dict, Optional, Tuple
 
-try:
-    from google import genai
-except Exception:  # pragma: no cover
-    genai = None
+from ollama import AsyncClient
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from calendar_api import create_event, daily_agenda_text, delete_event_by_name, list_events
-from config import GEMINI_API_KEY, GEMINI_MAX_RPM, ID_SEGUNDO_CALENDARIO, MI_CHAT_ID, TELEGRAM_TOKEN, TIMEZONE, UNI_REMINDER_DAYS, USE_GEMINI_ASSISTANT
+from config import DEBUG_ROUTER, ID_SEGUNDO_CALENDARIO, MI_CHAT_ID, OLLAMA_MODEL, TELEGRAM_TOKEN, TIMEZONE, UNI_REMINDER_DAYS
 from database import (
     agregar_objetivo_proyecto,
     agregar_tarea_suelta,
@@ -22,6 +19,7 @@ from database import (
     cambiar_estado_objetivo,
     cambiar_estado_tarea_suelta,
     cambiar_estado_universidad,
+    completar_todas_tareas_pendientes,
     init_db,
     listar_objetivos_proyectos,
     listar_tareas_sueltas,
@@ -33,13 +31,18 @@ from database import (
     vincular_universidad,
     universidad_vencida_o_proxima,
 )
-from ia_router import build_priority_instruction, build_router_instruction
+from ia_router import build_system_instruction
 
 COACH_WEEKDAYS = {0, 3}  # Monday and Thursday
 AFTERNOON_START_HOUR = 11
 AFTERNOON_END_HOUR = 17
-GEMINI_DISABLED_FOR_SESSION = False
-GEMINI_CALLS_MINUTE = deque(maxlen=max(GEMINI_MAX_RPM, 1) * 2)
+historial_mensajes: list[dict[str, str]] = []
+ollama_client = AsyncClient()
+
+
+def _debug_router(msg: str) -> None:
+    if DEBUG_ROUTER:
+        print(f"[router] {msg}")
 
 HELP_ACTIONS = {
     "help_tarea": "crear tarea comprar pan",
@@ -60,6 +63,17 @@ HELP_ACTIONS = {
 def _extraer_campos(texto: str, clave: str) -> Optional[str]:
     match = re.search(rf"{clave}:\s*(.+)", texto, flags=re.IGNORECASE)
     return match.group(1).strip() if match else None
+
+
+def _limpiar_valor_router(valor: Optional[str]) -> Optional[str]:
+    if not valor:
+        return None
+    limpio = str(valor).strip().strip("`").strip().strip("\"'").strip()
+    if not limpio:
+        return None
+    if set(limpio) <= set("`'\"-_:;,. "):
+        return None
+    return limpio
 
 
 def _strip_prefix(texto: str, prefixes: tuple[str, ...]) -> str:
@@ -167,6 +181,19 @@ def _extraer_texto_y_fecha(contenido: str) -> tuple[str, Optional[str], bool]:
     return contenido.strip(), None, False
 
 
+def _extraer_fecha_desde_datos_llm(datos: Dict[str, Any]) -> Optional[str]:
+    for clave in ("INICIO", "FIN"):
+        valor = str(datos.get(clave, "")).strip()
+        if not valor:
+            continue
+        # Limpieza suave para salidas tipo "(hora local)"
+        valor = re.sub(r"\(.*?\)", "", valor).strip()
+        parsed = _parse_fecha_cruda(valor)
+        if parsed:
+            return parsed[0]
+    return None
+
+
 def _normalizar_evento_intervalo(inicio_raw: str, fin_raw: str) -> tuple[Optional[str], Optional[str], bool]:
     inicio_parsed = _parse_fecha_cruda(inicio_raw)
     fin_parsed = _parse_fecha_cruda(fin_raw)
@@ -182,6 +209,9 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
     raw = texto.strip()
     low = raw.lower()
 
+    if _parece_borrado_masivo_tareas(low):
+        return "COMPLETAR_TODAS_TAREAS", {}
+
     if any(x in low for x in ("leer lo pendiente", "leer pendientes", "leer db", "ver pendientes", "mostrar pendientes")):
         return "LEER_DB", {}
 
@@ -190,6 +220,20 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
 
     if _parece_consulta_universidad(low):
         return "LEER_UNI", {}
+
+    # Objetivo de largo plazo/frase natural.
+    if re.search(r"\bmi\s+objetivo\b", low) or re.search(r"\bobjetivo\s+de\s+este\s+mes\b", low):
+        return "NUEVO_OBJETIVO", {"TEXTO": raw}
+
+    # Fallback robusto: si menciona entregable academico + fecha, tratarlo como universidad.
+    if any(x in low for x in ("entrega", "examen", "parcial", "final")):
+        tiene_fecha_explicita = bool(
+            re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}(\s+\d{1,2}:\d{2})?\b", low)
+            or re.search(r"\b\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2})?\b", low)
+            or re.search(r"\b(para|el|fecha)\b", low)
+        )
+        if tiene_fecha_explicita:
+            return "NUEVA_UNI", {"TEXTO": raw}
 
     if any(x in low for x in ("leer ", "estudiar ", "repasar ", "hacer ", "rendir ", "preparar ")) and not any(
         x in low for x in ("entrega", "examen", "parcial", "final")
@@ -309,99 +353,182 @@ def _parece_consulta_universidad(low: str) -> bool:
     return any(re.search(p, low) for p in patrones)
 
 
-def _gemini_client():
-    if not USE_GEMINI_ASSISTANT or not GEMINI_API_KEY or genai is None:
-        return None
-    try:
-        return genai.Client(api_key=GEMINI_API_KEY)
-    except Exception as exc:
-        print(f"No se pudo inicializar Gemini: {exc}")
-        return None
-
-
-def _gemini_puede_llamar() -> bool:
-    if GEMINI_MAX_RPM <= 0:
-        return False
-    ahora = datetime.datetime.now().timestamp()
-    ventana = 60.0
-    while GEMINI_CALLS_MINUTE and ahora - GEMINI_CALLS_MINUTE[0] > ventana:
-        GEMINI_CALLS_MINUTE.popleft()
-    return len(GEMINI_CALLS_MINUTE) < GEMINI_MAX_RPM
-
-
-def _gemini_generate(prompt: str) -> Optional[str]:
-    global GEMINI_DISABLED_FOR_SESSION
-    if GEMINI_DISABLED_FOR_SESSION:
-        return None
-    if not _gemini_puede_llamar():
-        print("Gemini omitido por limite local por minuto.")
-        return None
-    client = _gemini_client()
-    if client is None:
-        return None
-    GEMINI_CALLS_MINUTE.append(datetime.datetime.now().timestamp())
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        text = getattr(response, "text", None)
-        if text:
-            return text.strip()
-    except Exception as exc:
-        print(f"Gemini fallo: {exc}")
-        if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
-            GEMINI_DISABLED_FOR_SESSION = True
-            print("Gemini deshabilitado por esta sesion debido a quota 429.")
-    return None
-
-
-def _parsear_bloque_gemini(texto: str) -> tuple[str, Dict[str, Any]]:
+def _parsear_bloque_router(texto: str) -> tuple[str, Dict[str, Any]]:
     match = re.search(r"---COMANDO---\s*(.*?)\s*---FIN---", texto, flags=re.DOTALL | re.IGNORECASE)
-    if not match:
-        return "DESCONOCIDO", {"RESPUESTA": texto.strip()}
-    bloque = match.group(1)
+    bloque = match.group(1) if match else texto
+
     accion = (_extraer_campos(bloque, "ACCION") or "DESCONOCIDO").upper()
+    if accion == "DESCONOCIDO":
+        # Fallback para respuestas libres tipo "Acción: NUEVA_TAREA"
+        m_accion = re.search(r"\bacci[oó]n\s*:\s*([A-Z_]+)\b", bloque, flags=re.IGNORECASE)
+        if m_accion:
+            accion = m_accion.group(1).upper()
+
     datos: Dict[str, Any] = {}
     for clave in ("TEXTO", "EVENTO", "INICIO", "FIN", "TIPO", "ITEM_ID", "RAZON", "MATERIA", "DESCRIPCION"):
-        valor = _extraer_campos(bloque, clave)
+        valor = _limpiar_valor_router(_extraer_campos(bloque, clave))
         if valor:
             datos[clave] = valor
+
+    # Normalizacion: algunos modelos devuelven BORRAR + TEXTO en lugar de EVENTO.
+    if accion == "BORRAR" and "EVENTO" not in datos and "TEXTO" in datos:
+        evento = str(datos["TEXTO"]).split("|")[0].strip()
+        if evento:
+            datos["EVENTO"] = evento
+
+    # Fallback extra: "Fecha y hora de inicio ISO 8601: ..."
+    if "INICIO" not in datos:
+        m_inicio = re.search(
+            r"(?:fecha\s+y\s+hora\s+de\s+inicio\s+iso\s*8601|inicio)\s*:\s*(.+)",
+            bloque,
+            flags=re.IGNORECASE,
+        )
+        if m_inicio:
+            datos["INICIO"] = m_inicio.group(1).strip()
+
+    if accion == "DESCONOCIDO":
+        return "DESCONOCIDO", {"RESPUESTA": texto.strip()}
     return accion, datos
 
 
-def _interpretar_con_gemini(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
-    prompt = build_router_instruction(texto_usuario)
-    salida = _gemini_generate(prompt)
-    if not salida:
+def _extraer_evento_desde_texto_usuario(texto: str) -> str:
+    low = texto.lower().strip()
+    low = re.sub(r"^(cancela(?:me)?|borra(?:me)?|elimina(?:me)?)\s+", "", low)
+    low = re.sub(r"^(la|el|los|las)\s+", "", low)
+    low = re.sub(r"^(entrega|evento|parcial|examen|final)\s+(del?|de la)\s+", "", low)
+    low = re.sub(r"^(del?|de la)\s+", "", low)
+    return low.strip()
+
+
+def _parece_intencion_borrar(texto: str) -> bool:
+    low = texto.lower()
+    return any(k in low for k in ("cancelar", "cancelame", "cancelá", "cancela", "borrar", "borra", "eliminar", "elimina"))
+
+
+
+def _parece_borrado_masivo_tareas(texto: str) -> bool:
+    low = texto.lower()
+    patrones = (
+        "borra todas las tareas",
+        "borrar todas las tareas",
+        "elimina todas las tareas",
+        "eliminar todas las tareas",
+        "limpia todas las tareas",
+        "limpiar todas las tareas",
+        "borra todas mis tareas",
+        "borra tareas pendientes",
+        "borrar tareas pendientes",
+        "elimina tareas pendientes",
+        "eliminar tareas pendientes",
+        "borra todos los pendientes",
+        "completa todas las tareas",
+        "completar todas las tareas",
+    )
+    return any(p in low for p in patrones)
+
+
+def _intencion_explicita_para_accion(texto: str, accion: str) -> bool:
+    low = texto.lower()
+    reglas: dict[str, tuple[str, ...]] = {
+        "BORRAR": ("cancelar", "cancelame", "cancela", "borrar", "borra", "eliminar", "elimina"),
+        "CREAR": ("crear evento", "agendar evento", "programar evento"),
+        "LISTAR": ("leer eventos", "ver eventos", "mostrar eventos", "agenda"),
+        "LEER_DB": ("leer db", "leer pendientes", "ver pendientes", "mostrar pendientes"),
+        "LEER_UNI": ("leer uni", "leer universidad", "ver uni", "ver universidad", "mostrar uni", "mostrar universidad"),
+        "NUEVA_TAREA": ("nueva tarea", "crear tarea", "agregar tarea", "anotar tarea", "guardar tarea", "recordar"),
+        "NUEVO_OBJETIVO": ("nuevo objetivo", "crear objetivo", "agregar objetivo", "anotar objetivo", "guardar objetivo"),
+        "NUEVA_UNI": ("nueva uni", "nueva entrega", "nuevo examen", "nuevo parcial", "nuevo final", "nueva final"),
+        "COMPLETAR_TAREA": ("completar tarea", "marcar tarea", "terminar tarea", "finalizar tarea", "hecho tarea"),
+        "COMPLETAR_OBJETIVO": ("completar objetivo", "marcar objetivo", "terminar objetivo", "finalizar objetivo", "hecho objetivo"),
+        "COMPLETAR_UNI": ("completar uni", "marcar uni", "terminar uni", "finalizar uni", "hecho uni", "hecho universidad"),
+        "COMPLETAR_TODAS_TAREAS": (
+            "borra todas las tareas",
+            "borrar todas las tareas",
+            "elimina todas las tareas",
+            "eliminar todas las tareas",
+            "limpia todas las tareas",
+            "borrar tareas pendientes",
+            "eliminar tareas pendientes",
+            "completar todas las tareas",
+        ),
+    }
+    kws = reglas.get(accion, ())
+    return any(k in low for k in kws)
+
+
+async def _interpretar_con_ollama(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
+    # Router en modo stateless: cada mensaje se clasifica de forma aislada para
+    # evitar contaminacion de contexto entre solicitudes.
+    mensajes = [
+        {"role": "system", "content": build_system_instruction()},
+        {"role": "user", "content": texto_usuario},
+    ]
+    _debug_router(f"user='{texto_usuario}'")
+
+    try:
+        respuesta = await ollama_client.chat(
+            model=OLLAMA_MODEL,
+            messages=mensajes,
+            options={'temperature': 0.0, 'top_p': 0.1},
+        )
+        contenido = (respuesta.get("message") or {}).get("content", "").strip()
+    except Exception as exc:
+        logging.exception("Ollama fallo durante chat")
         return "DESCONOCIDO", {}
-    accion, datos = _parsear_bloque_gemini(salida)
+
+    if not contenido:
+        _debug_router("ollama returned empty content")
+        return "DESCONOCIDO", {}
+    _debug_router(f"ollama_raw='{contenido[:300]}'")
+
+    accion, datos = _parsear_bloque_router(contenido)
+    _debug_router(f"parsed accion={accion} datos={datos}")
     if accion == "DESCONOCIDO" and "RESPUESTA" in datos:
         return "RESPUESTA", datos
     return accion, datos
 
 
-def _snapshot_to_plain_text(pendientes: dict[str, list[dict[str, Any]]]) -> str:
-    lineas = []
-    if pendientes["universidad"]:
-        lineas.append("Universidad:")
-        for item in pendientes["universidad"][:6]:
-            fecha = f" | {_formatear_fecha_amigable(str(item['fecha_evento']))}" if item.get("fecha_evento") else ""
-            materia = f" | {_title_case_texto(item['materia'])}" if item.get("materia") else ""
-            lineas.append(
-                f"- {_title_case_texto(item['titulo'])}{materia} [{_title_case_texto(item['tipo'])}] ({_title_case_texto(item['estado'])}){fecha}"
-            )
-    if pendientes["objetivos_proyectos"]:
-        lineas.append("Objetivos:")
-        for item in pendientes["objetivos_proyectos"][:6]:
-            fecha = f" | {_formatear_fecha_amigable(str(item['fecha_evento']))}" if item.get("fecha_evento") else ""
-            lineas.append(f"- {_title_case_texto(item['descripcion'])} ({_title_case_texto(item['estado'])}){fecha}")
-    if pendientes["tareas_sueltas"]:
-        lineas.append("Tareas:")
-        for item in pendientes["tareas_sueltas"][:6]:
-            fecha = f" | {_formatear_fecha_amigable(str(item['fecha_evento']))}" if item.get("fecha_evento") else ""
-            lineas.append(f"- {_title_case_texto(item['texto'])} ({_title_case_texto(item['estado'])}){fecha}")
-    return "\n".join(lineas) if lineas else "Sin pendientes."
+async def obtener_comando_ia(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
+    """Enrutador hibrido oficial (LLM + guardrails locales)."""
+    accion, datos = ("DESCONOCIDO", {})
+    respuesta_libre_llm: Optional[str] = None
+
+    if _parece_borrado_masivo_tareas(texto_usuario):
+        return "COMPLETAR_TODAS_TAREAS", {}
+
+    accion_llm, datos_llm = await _interpretar_con_ollama(texto_usuario)
+    _debug_router(f"accion_llm={accion_llm} datos_llm={datos_llm}")
+    if accion_llm != "DESCONOCIDO":
+        accion, datos = accion_llm, datos_llm
+    elif "RESPUESTA" in datos_llm:
+        respuesta_libre_llm = str(datos_llm["RESPUESTA"]).strip()
+
+    if accion == "DESCONOCIDO":
+        accion, datos = _parsear_comando_local(texto_usuario)
+        _debug_router(f"fallback_local accion={accion} datos={datos}")
+    else:
+        accion_local, datos_local = _parsear_comando_local(texto_usuario)
+        _debug_router(f"guardrail_local accion={accion_local} datos={datos_local}")
+        if accion_local != "DESCONOCIDO":
+            # Prioridad fuerte: universidad y objetivos detectados localmente.
+            if accion_local in ("NUEVA_UNI", "NUEVO_OBJETIVO"):
+                accion, datos = accion_local, datos_local
+                _debug_router(f"accion_sobrescrita_por_guardrail_fuerte accion={accion} datos={datos}")
+            elif accion in ("DESCONOCIDO", "LISTAR") or _intencion_explicita_para_accion(texto_usuario, accion_local):
+                accion, datos = accion_local, datos_local
+                _debug_router(f"accion_sobrescrita_por_intencion accion={accion} datos={datos}")
+
+    if _parece_intencion_borrar(texto_usuario) and accion in ("DESCONOCIDO", "LISTAR"):
+        accion = "BORRAR"
+        if not _limpiar_valor_router(str(datos.get("EVENTO", "")).strip()):
+            datos["EVENTO"] = _extraer_evento_desde_texto_usuario(texto_usuario)
+        _debug_router(f"normalizado_por_texto accion={accion} datos={datos}")
+
+    if accion == "DESCONOCIDO" and respuesta_libre_llm:
+        return "RESPUESTA", {"RESPUESTA": respuesta_libre_llm}
+
+    _debug_router(f"accion_final={accion} datos_final={datos}")
+    return accion, datos
 
 
 def _prioridad_score_item(tipo: str, item: dict[str, Any]) -> tuple[int, int, str]:
@@ -472,23 +599,6 @@ def _elegir_prioridad_local(pendientes: dict[str, list[dict[str, Any]]]) -> dict
     elegido = candidatos[0]
     elegido.pop("_SCORE", None)
     return elegido
-
-
-def _elegir_prioridad_con_gemini(pendientes: dict[str, list[dict[str, Any]]]) -> dict[str, str]:
-    resumen = _snapshot_to_plain_text(pendientes)
-    prompt = build_priority_instruction(resumen)
-    salida = _gemini_generate(prompt)
-    if not salida:
-        return _elegir_prioridad_local(pendientes)
-    accion, datos = _parsear_bloque_gemini(salida)
-    if accion != "PRIORIDAD":
-        return _elegir_prioridad_local(pendientes)
-    return {
-        "TIPO": datos.get("TIPO", "NINGUNO"),
-        "ITEM_ID": datos.get("ITEM_ID", ""),
-        "TEXTO": datos.get("TEXTO", ""),
-        "RAZON": datos.get("RAZON", "prioridad elegida por Gemini"),
-    }
 
 
 def _buscar_item_por_objetivo(items: list[dict[str, Any]], objetivo: str, campos: tuple[str, ...]) -> Optional[dict[str, Any]]:
@@ -904,7 +1014,7 @@ def _parse_universidad_payload(contenido: str) -> dict[str, str]:
 async def _build_proactive_note() -> str:
     pendientes = await snapshot_pendientes()
     uni_proximas = await universidad_vencida_o_proxima(UNI_REMINDER_DAYS)
-    prioridad = _elegir_prioridad_con_gemini(pendientes)
+    prioridad = _elegir_prioridad_local(pendientes)
     tipo = prioridad.get("TIPO", "NINGUNO").upper()
     texto = prioridad.get("TEXTO", "").strip()
     razon = prioridad.get("RAZON", "").strip()
@@ -951,19 +1061,19 @@ async def _build_proactive_note() -> str:
             fecha = f" para {_formatear_fecha_amigable(uni['fecha_evento'])}" if uni.get("fecha_evento") else ""
             mensaje = f"Prioridad del dia: {_title_case_texto(uni.get('titulo', ''))}{materia}{fecha}."
             if razon:
-                mensaje += f" Gemini lo marco asi: {razon}."
+                mensaje += f" Motivo: {razon}."
             return mensaje
 
     if tipo == "OBJETIVO":
         mensaje = f"Prioridad del dia: {_title_case_texto(texto)}."
         if razon:
-            mensaje += f" Gemini lo priorizo porque {razon}."
+            mensaje += f" Motivo: {razon}."
         return mensaje
 
     if tipo == "TAREA":
         mensaje = f"Prioridad del dia: {_title_case_texto(texto)}."
         if razon:
-            mensaje += f" Gemini la priorizo porque {razon}."
+            mensaje += f" Motivo: {razon}."
         return mensaje
 
     return f"Prioridad del dia: {_title_case_texto(texto)}. {razon}".strip()
@@ -1078,21 +1188,11 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mensaje_espera = await update.message.reply_text("Procesando...")
 
     try:
-        accion, datos = ("DESCONOCIDO", {})
-
-        if _parece_consulta_universidad(texto_usuario.lower()):
-            accion, datos = "LEER_UNI", {}
-
-        if accion == "DESCONOCIDO" and USE_GEMINI_ASSISTANT:
-            accion_g, datos_g = _interpretar_con_gemini(texto_usuario)
-            if accion_g != "DESCONOCIDO":
-                accion, datos = accion_g, datos_g
-            elif "RESPUESTA" in datos_g:
-                await mensaje_espera.edit_text(datos_g["RESPUESTA"])
-                return
-
-        if accion == "DESCONOCIDO":
-            accion, datos = _parsear_comando_local(texto_usuario)
+        _debug_router(f"procesar_mensaje start text='{texto_usuario}'")
+        accion, datos = await obtener_comando_ia(texto_usuario)
+        if accion == "RESPUESTA":
+            await mensaje_espera.edit_text(str(datos.get("RESPUESTA", "")).strip() or "No lo pude entender bien. Reformulalo un poquito o usa /help.")
+            return
 
         if accion == "LISTAR":
             inicio = datos.get("INICIO")
@@ -1134,8 +1234,22 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await mensaje_espera.edit_text("Evento agendado.")
             return
 
+        if accion == "COMPLETAR_TODAS_TAREAS":
+            cantidad = await completar_todas_tareas_pendientes()
+            if cantidad == 0:
+                await mensaje_espera.edit_text("No habia tareas pendientes para limpiar.")
+            else:
+                await mensaje_espera.edit_text(f"Listo. Marque {cantidad} tarea(s) como completada(s).")
+            return
+
         if accion == "BORRAR":
-            nombre_buscar = datos.get("EVENTO") or texto_usuario
+            nombre_buscar = (
+                _limpiar_valor_router(datos.get("EVENTO"))
+                or _limpiar_valor_router(str(datos.get("TEXTO", "")).split("|")[0].strip())
+                or _extraer_evento_desde_texto_usuario(texto_usuario)
+                or texto_usuario
+            )
+            _debug_router(f"borrar nombre_buscar='{nombre_buscar}'")
             ahora_iso = datetime.datetime.now(TIMEZONE).isoformat()
             borrado = delete_event_by_name(nombre_buscar, ahora_iso)
             if borrado:
@@ -1146,6 +1260,8 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if accion == "NUEVA_TAREA":
             texto, fecha_iso, _all_day = _extraer_texto_y_fecha(datos.get("TEXTO") or texto_usuario)
+            if not fecha_iso:
+                fecha_iso = _extraer_fecha_desde_datos_llm(datos)
             if not texto:
                 await mensaje_espera.edit_text("Necesito el texto de la tarea.")
                 return
@@ -1163,6 +1279,8 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if accion == "NUEVO_OBJETIVO":
             texto, fecha_iso, _all_day = _extraer_texto_y_fecha(datos.get("TEXTO") or texto_usuario)
+            if not fecha_iso:
+                fecha_iso = _extraer_fecha_desde_datos_llm(datos)
             if not texto:
                 await mensaje_espera.edit_text("Necesito el texto del objetivo.")
                 return
@@ -1180,6 +1298,8 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if accion == "NUEVA_UNI":
             payload = _parse_universidad_payload(datos.get("TEXTO") or texto_usuario)
+            if not payload.get("fecha"):
+                payload["fecha"] = _extraer_fecha_desde_datos_llm(datos) or ""
             titulo = payload.get("titulo", "").strip()
             if not titulo:
                 await mensaje_espera.edit_text("Necesito un titulo para la materia/examen/entrega.")
@@ -1321,6 +1441,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "No lo pude entender bien. Reformulalo un poquito o usa /help."
         )
     except Exception as e:
+        logging.exception("Error de sistema en procesar_mensaje")
         await mensaje_espera.edit_text(f"Error de sistema: {e}")
 
 
@@ -1336,6 +1457,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -1351,16 +1473,23 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje))
     app.add_error_handler(error_handler)
 
-    hora_alarma = datetime.time(hour=10, minute=0, tzinfo=TIMEZONE)
-    app.job_queue.run_daily(resumen_diario, time=hora_alarma)
-    app.job_queue.run_daily(coach_proactivo, time=datetime.time(hour=10, minute=20, tzinfo=TIMEZONE))
-    _schedule_next_afternoon_nudge(app.job_queue)
+    # === MOTOR PROACTIVO (SCHEDULER) ===
+    hora_reporte = datetime.time(hour=8, minute=0, tzinfo=TIMEZONE)
+    app.job_queue.run_daily(job_reporte_diario, time=hora_reporte)
+
+    hora_nudge = datetime.time(hour=16, minute=30, tzinfo=TIMEZONE)
+    app.job_queue.run_daily(job_nudge_objetivos, time=hora_nudge, days=(1, 4))  # Martes y Viernes
+
+    # --- MODO TEST (descomentar cuando necesites validar ahora mismo) ---
+    # app.job_queue.run_once(job_reporte_diario, when=5)
+    # app.job_queue.run_once(job_nudge_objetivos, when=10, data={"force": True})
 
     print("=======================================")
-    print(" SECRETARIA VIRTUAL v6.0 (Life OS)    ")
+    print(" SECRETARIA VIRTUAL v6.0 (Proactiva)  ")
     print("=======================================")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
+
