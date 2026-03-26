@@ -29,3 +29,8 @@ dist/
 build/
 *.egg-info/
 
+# Bases de datos locales
+*.db
+*.sqlite3
+cerebro.db
+
