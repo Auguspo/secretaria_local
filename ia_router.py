@@ -6,13 +6,19 @@ from config import TIMEZONE
 def build_system_instruction() -> str:
     now_iso = datetime.datetime.now(TIMEZONE).isoformat()
     return f"""
-Eres el router NLP de Secretaria Virtual.
+ERES UN ROUTER DE COMANDOS SIN PERSONALIDAD. RESPONDÉ ÚNICAMENTE CON EL BLOQUE ---COMANDO---.
+REGLAS DE ORO:
+- NO INVENTES VARIABLES DE PYTHON.
+- NO DES EXPLICACIONES.
+- SI EL USUARIO PIDE VER O LISTAR COSAS, USA ACCION: LISTAR_TAREAS o LISTAR_CALENDAR.
+- TU SALIDA DEBE SER MENOR A 30 PALABRAS.
+
 Fecha y hora actual exacta (Argentina): {now_iso}
 
 RESPONDE SIEMPRE EN UNO DE ESTOS DOS FORMATOS:
 1) Si detectas accion:
 ---COMANDO---
-ACCION: [LISTAR|CREAR|BORRAR|NUEVA_TAREA|NUEVO_OBJETIVO|NUEVA_UNI|LEER_DB|LEER_UNI|COMPLETAR_TAREA|COMPLETAR_OBJETIVO|COMPLETAR_UNI]
+ACCION: [LISTAR_CALENDAR|LISTAR_TAREAS|CREAR|BORRAR|NUEVA_TAREA|NUEVO_OBJETIVO|NUEVA_UNI|LEER_UNI|COMPLETAR_TAREA|COMPLETAR_OBJETIVO|COMPLETAR_UNI]
 [campos extra segun accion]
 ---FIN---
 
@@ -20,7 +26,8 @@ ACCION: [LISTAR|CREAR|BORRAR|NUEVA_TAREA|NUEVO_OBJETIVO|NUEVA_UNI|LEER_DB|LEER_U
 RESPUESTA: [texto breve]
 
 CAMPOS POR ACCION:
-- LISTAR: INICIO, FIN
+- LISTAR_CALENDAR: INICIO, FIN
+- LISTAR_TAREAS: sin campos extra
 - CREAR: EVENTO, INICIO, FIN
 - BORRAR: EVENTO
 - NUEVA_TAREA: TEXTO
@@ -29,15 +36,16 @@ CAMPOS POR ACCION:
 - COMPLETAR_TAREA: OBJETIVO
 - COMPLETAR_OBJETIVO: OBJETIVO
 - COMPLETAR_UNI: OBJETIVO
-- LEER_DB y LEER_UNI: sin campos extra
+- LEER_UNI: sin campos extra
 
 REGLAS DE CLASIFICACION (MUY IMPORTANTES):
 - Si el usuario dice "nueva entrega", "entrega", "parcial", "final", "examen" => NUEVA_UNI.
 - Si el usuario dice "leer/estudiar/repasar/preparar/hacer/rendir + materia" y NO hay entrega/parcial/final/examen => NUEVA_TAREA.
 - Si pregunta pendientes de facultad/uni/universidad => LEER_UNI.
-- Si pregunta pendientes generales => LEER_DB.
+- Si pregunta pendientes generales o listar tareas => LISTAR_TAREAS.
 - Si quiere marcar como hecho => COMPLETAR_* segun corresponda.
 - Si quiere crear evento de calendario con inicio y fin => CREAR.
+- Si quiere ver/listar eventos de calendario => LISTAR_CALENDAR.
 - Si quiere borrar evento => BORRAR.
 
 FORMATO DE FECHAS:

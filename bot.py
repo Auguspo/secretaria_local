@@ -215,6 +215,19 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
     if any(x in low for x in ("leer lo pendiente", "leer pendientes", "leer db", "ver pendientes", "mostrar pendientes")):
         return "LEER_DB", {}
 
+    if any(
+        x in low
+        for x in (
+            "que tareas tengo",
+            "qué tareas tengo",
+            "leer tareas",
+            "ver tareas",
+            "mostrar tareas",
+            "listar tareas",
+        )
+    ):
+        return "LEER_DB", {}
+
     if any(x in low for x in ("leer uni", "leer universidad", "ver uni", "ver universidad", "mostrar uni", "mostrar universidad")):
         return "LEER_UNI", {}
 
@@ -364,6 +377,30 @@ def _parsear_bloque_router(texto: str) -> tuple[str, Dict[str, Any]]:
         if m_accion:
             accion = m_accion.group(1).upper()
 
+    if accion == "DESCONOCIDO":
+        # Fallback para salidas ultra-minimas: primera linea = accion.
+        valid_tokens = {
+            "LISTAR_TAREAS",
+            "LISTAR_CALENDAR",
+            "LEER_TAREAS",
+            "LISTAR",
+            "CREAR",
+            "BORRAR",
+            "NUEVA_TAREA",
+            "NUEVO_OBJETIVO",
+            "NUEVA_UNI",
+            "LEER_DB",
+            "LEER_UNI",
+            "COMPLETAR_TAREA",
+            "COMPLETAR_OBJETIVO",
+            "COMPLETAR_UNI",
+        }
+        for ln in bloque.splitlines():
+            token = re.sub(r"[^A-Z_]", "", ln.strip().upper())
+            if token in valid_tokens:
+                accion = token
+                break
+
     datos: Dict[str, Any] = {}
     for clave in ("TEXTO", "EVENTO", "INICIO", "FIN", "TIPO", "ITEM_ID", "RAZON", "MATERIA", "DESCRIPCION"):
         valor = _limpiar_valor_router(_extraer_campos(bloque, clave))
@@ -469,7 +506,7 @@ async def _interpretar_con_ollama(texto_usuario: str) -> tuple[str, Dict[str, An
         respuesta = await ollama_client.chat(
             model=OLLAMA_MODEL,
             messages=mensajes,
-            options={'temperature': 0.0, 'top_p': 0.1},
+            options={'temperature': 0.0, 'top_p': 0.1, 'num_predict': 50},
         )
         contenido = (respuesta.get("message") or {}).get("content", "").strip()
     except Exception as exc:
@@ -498,6 +535,10 @@ async def obtener_comando_ia(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
 
     accion_llm, datos_llm = await _interpretar_con_ollama(texto_usuario)
     _debug_router(f"accion_llm={accion_llm} datos_llm={datos_llm}")
+    if accion_llm in ("LISTAR_TAREAS", "LEER_TAREAS"):
+        accion_llm = "LEER_DB"
+    elif accion_llm == "LISTAR_CALENDAR":
+        accion_llm = "LISTAR"
     if accion_llm != "DESCONOCIDO":
         accion, datos = accion_llm, datos_llm
     elif "RESPUESTA" in datos_llm:
@@ -506,6 +547,12 @@ async def obtener_comando_ia(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
     if accion == "DESCONOCIDO":
         accion, datos = _parsear_comando_local(texto_usuario)
         _debug_router(f"fallback_local accion={accion} datos={datos}")
+    elif accion == "RESPUESTA":
+        accion_local, datos_local = _parsear_comando_local(texto_usuario)
+        _debug_router(f"guardrail_resp accion={accion_local} datos={datos_local}")
+        if accion_local != "DESCONOCIDO":
+            accion, datos = accion_local, datos_local
+            _debug_router(f"accion_sobrescrita_desde_respuesta accion={accion} datos={datos}")
     else:
         accion_local, datos_local = _parsear_comando_local(texto_usuario)
         _debug_router(f"guardrail_local accion={accion_local} datos={datos_local}")
