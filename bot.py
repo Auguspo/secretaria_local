@@ -296,6 +296,30 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
     if _parece_consulta_universidad(low):
         return "LEER_UNI", {}
 
+    # Comandos de completado en lenguaje natural (prefix): completar/completame X
+    m_complete_prefix = re.match(
+        r"^\s*(completar|completame|marcar|marcame|terminar|terminame|finalizar|finalizame)\b\s*(.*)$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if m_complete_prefix:
+        objetivo_txt = (m_complete_prefix.group(2) or "").strip()
+        low_obj = objetivo_txt.lower()
+        if any(k in low_obj for k in ("universidad", "uni", "facu", "facultad", "parcial", "final", "examen", "entrega", "tp", "trabajo practico", "trabajo práctico")):
+            low_obj = re.sub(r"^(la|el|las|los)\s+", "", low_obj)
+            low_obj = re.sub(r"^(universidad|uni|facu|facultad)\s*", "", low_obj).strip()
+            return "COMPLETAR_UNI", {"OBJETIVO": objetivo_txt if objetivo_txt else ""}
+        if any(k in low_obj for k in ("objetivo", "meta", "proyecto")):
+            low_obj = re.sub(r"^(la|el|las|los)\s+", "", low_obj)
+            low_obj = re.sub(r"^(objetivo|meta|proyecto)\s*", "", low_obj).strip()
+            return "COMPLETAR_OBJETIVO", {"OBJETIVO": objetivo_txt if objetivo_txt else ""}
+        if any(k in low_obj for k in ("tarea", "pendiente")):
+            low_obj = re.sub(r"^(la|el|las|los)\s+", "", low_obj)
+            low_obj = re.sub(r"^(tarea|pendiente)\s*", "", low_obj).strip()
+            return "COMPLETAR_TAREA", {"OBJETIVO": objetivo_txt if objetivo_txt else ""}
+        # Sin tipo explicito: default a tarea por ser la accion mas frecuente.
+        return "COMPLETAR_TAREA", {"OBJETIVO": objetivo_txt}
+
     if re.search(
         r"^(anota(?:me)?|agrega(?:me)?|guarda(?:me)?|recorda(?:me)?|recordame)\b.*\btarea\s+pendiente\b",
         low,
@@ -338,35 +362,46 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
             return "NUEVA_TAREA", {"TEXTO": raw}
         return "NUEVA_UNI", {"TEXTO": raw}
 
-    if any(x in low for x in ("completar uni", "marcar uni", "terminar uni", "finalizar uni", "hecho uni")):
+    if any(x in low for x in ("completar uni", "completame uni", "completar universidad", "completame universidad", "marcar uni", "terminar uni", "finalizar uni", "hecho uni")):
         contenido = re.sub(
-            r"^(completar|marcar|terminar|finalizar)\s+uni(?:versidad)?\s*[:\-]?\s*",
+            r"^(completar|completame|marcar|terminar|finalizar)\s+uni(?:versidad)?\s*[:\-]?\s*",
             "",
             raw,
             flags=re.IGNORECASE,
         )
         contenido = contenido.replace("hecho uni", "").replace("hecho universidad", "").strip()
-        return "COMPLETAR_UNI", {"OBJETIVO": contenido or raw}
+        return "COMPLETAR_UNI", {"OBJETIVO": contenido}
 
-    if any(x in low for x in ("completar tarea", "marcar tarea", "terminar tarea", "finalizar tarea", "hecho tarea")):
+    if any(x in low for x in ("completar tarea", "completame tarea", "marcar tarea", "terminar tarea", "finalizar tarea", "hecho tarea")):
         contenido = re.sub(
-            r"^(completar|marcar|terminar|finalizar)\s+tarea\s*[:\-]?\s*",
+            r"^(completar|completame|marcar|terminar|finalizar)\s+tarea\s*[:\-]?\s*",
             "",
             raw,
             flags=re.IGNORECASE,
         )
         contenido = contenido.replace("hecho tarea", "").strip()
-        return "COMPLETAR_TAREA", {"OBJETIVO": contenido or raw}
+        return "COMPLETAR_TAREA", {"OBJETIVO": contenido}
 
-    if any(x in low for x in ("completar objetivo", "marcar objetivo", "terminar objetivo", "finalizar objetivo", "hecho objetivo")):
+    if any(x in low for x in ("completar objetivo", "completame objetivo", "marcar objetivo", "terminar objetivo", "finalizar objetivo", "hecho objetivo")):
         contenido = re.sub(
-            r"^(completar|marcar|terminar|finalizar)\s+objetivo\s*[:\-]?\s*",
+            r"^(completar|completame|marcar|terminar|finalizar)\s+objetivo\s*[:\-]?\s*",
             "",
             raw,
             flags=re.IGNORECASE,
         )
         contenido = contenido.replace("hecho objetivo", "").strip()
-        return "COMPLETAR_OBJETIVO", {"OBJETIVO": contenido or raw}
+        return "COMPLETAR_OBJETIVO", {"OBJETIVO": contenido}
+
+    # Frases naturales tipo: "Trabajo Practico - Estadistica completado"
+    m_done = re.match(r"^\s*(.+?)\s+(completad[oa]|terminad[oa]|hech[oa]|list[oa])\s*$", raw, flags=re.IGNORECASE)
+    if m_done:
+        objetivo_txt = m_done.group(1).strip()
+        low_obj = objetivo_txt.lower()
+        if any(k in low_obj for k in ("trabajo", "tp", "entrega", "parcial", "final", "examen", "materia", "estadistica", "sistemas")):
+            return "COMPLETAR_UNI", {"OBJETIVO": objetivo_txt}
+        if "objetivo" in low_obj or "meta" in low_obj:
+            return "COMPLETAR_OBJETIVO", {"OBJETIVO": objetivo_txt}
+        return "COMPLETAR_TAREA", {"OBJETIVO": objetivo_txt}
 
     if any(x in low for x in ("nueva uni", "agregar uni", "guardar uni", "anotar uni", "nuevo examen", "nueva entrega", "nuevo parcial", "nuevo final", "nueva final", "final")):
         contenido = _strip_prefix(
@@ -523,10 +558,11 @@ def _parece_borrado_masivo_tareas(texto: str) -> bool:
     low = texto.lower()
     if "evento" in low:
         return False
-    if re.search(
-        r"\b(elimina(?:me)?|borrar(?:me)?|borra(?:me)?|limpia(?:me)?|completa(?:me)?|completar|marca(?:me)?)\b.*\btarea\w*\b",
-        low,
-    ):
+    if re.search(r"\b(elimina(?:me)?|borrar(?:me)?|borra(?:me)?|limpia(?:me)?|completa(?:me)?|completar|marca(?:me)?)\b", low) and re.search(r"\btarea\w*\b", low):
+        alcance_masivo = any(k in low for k in ("todas", "todos", "pendiente", "pendientes", "mis tareas", "las tareas"))
+        if alcance_masivo:
+            return True
+    if re.search(r"\b(elimina(?:me)?|borrar(?:me)?|borra(?:me)?)\s+las?\s+tarea\w*\b", low):
         return True
     patrones = (
         "borra todas las tareas",
@@ -558,9 +594,9 @@ def _intencion_explicita_para_accion(texto: str, accion: str) -> bool:
         "NUEVA_TAREA": ("nueva tarea", "crear tarea", "agregar tarea", "anotar tarea", "guardar tarea", "recordar"),
         "NUEVO_OBJETIVO": ("nuevo objetivo", "crear objetivo", "agregar objetivo", "anotar objetivo", "guardar objetivo"),
         "NUEVA_UNI": ("nueva uni", "nueva entrega", "nuevo examen", "nuevo parcial", "nuevo final", "nueva final"),
-        "COMPLETAR_TAREA": ("completar tarea", "marcar tarea", "terminar tarea", "finalizar tarea", "hecho tarea"),
-        "COMPLETAR_OBJETIVO": ("completar objetivo", "marcar objetivo", "terminar objetivo", "finalizar objetivo", "hecho objetivo"),
-        "COMPLETAR_UNI": ("completar uni", "marcar uni", "terminar uni", "finalizar uni", "hecho uni", "hecho universidad"),
+        "COMPLETAR_TAREA": ("completar tarea", "completame tarea", "marcar tarea", "marcame tarea", "terminar tarea", "terminame tarea", "finalizar tarea", "finalizame tarea", "hecho tarea"),
+        "COMPLETAR_OBJETIVO": ("completar objetivo", "completame objetivo", "marcar objetivo", "marcame objetivo", "terminar objetivo", "terminame objetivo", "finalizar objetivo", "finalizame objetivo", "hecho objetivo"),
+        "COMPLETAR_UNI": ("completar uni", "completame uni", "completar universidad", "completame universidad", "marcar uni", "marcame uni", "terminar uni", "terminame uni", "finalizar uni", "finalizame uni", "hecho uni", "hecho universidad"),
         "COMPLETAR_TODAS_TAREAS": (
             "borra todas las tareas",
             "borrar todas las tareas",
@@ -643,7 +679,7 @@ async def obtener_comando_ia(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
         _debug_router(f"guardrail_local accion={accion_local} datos={datos_local}")
         if accion_local != "DESCONOCIDO":
             # Prioridad fuerte: universidad y objetivos detectados localmente.
-            if accion_local in ("NUEVA_UNI", "NUEVO_OBJETIVO"):
+            if accion_local in ("NUEVA_UNI", "NUEVO_OBJETIVO", "COMPLETAR_TAREA", "COMPLETAR_OBJETIVO", "COMPLETAR_UNI"):
                 accion, datos = accion_local, datos_local
                 _debug_router(f"accion_sobrescrita_por_guardrail_fuerte accion={accion} datos={datos}")
             elif accion in ("DESCONOCIDO", "LISTAR") or _intencion_explicita_para_accion(texto_usuario, accion_local):
@@ -776,18 +812,24 @@ async def _marcar_como_hecho(tipo: str, objetivo: str) -> tuple[bool, str]:
     if tipo == "tarea":
         items = await listar_tareas_sueltas(solo_activas=True)
         item = _buscar_item_por_objetivo(items, objetivo, ("texto",))
+        if item is None and not (objetivo or "").strip() and items:
+            item = items[0]
         if item:
             await cambiar_estado_tarea_suelta(int(item["id"]), "Completada")
             return True, item["texto"]
     if tipo == "objetivo":
         items = await listar_objetivos_proyectos(solo_activos=True)
         item = _buscar_item_por_objetivo(items, objetivo, ("descripcion",))
+        if item is None and not (objetivo or "").strip() and items:
+            item = items[0]
         if item:
             await cambiar_estado_objetivo(int(item["id"]), "Logrado")
             return True, item["descripcion"]
     if tipo == "uni":
         items = await listar_universidad(solo_activas=True)
         item = _buscar_item_por_objetivo(items, objetivo, ("titulo", "materia", "descripcion"))
+        if item is None and not (objetivo or "").strip() and items:
+            item = items[0]
         if item:
             await cambiar_estado_universidad(int(item["id"]), "Realizado")
             return True, _resumen_universidad_item(item)
@@ -1488,7 +1530,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if accion == "COMPLETAR_TAREA":
-            objetivo = datos.get("OBJETIVO") or texto_usuario
+            objetivo = datos["OBJETIVO"] if "OBJETIVO" in datos else texto_usuario
             ok, texto_item = await _marcar_como_hecho("tarea", objetivo)
             if ok:
                 await mensaje_espera.edit_text(f"Tarea marcada como completada: {texto_item}")
@@ -1497,7 +1539,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if accion == "COMPLETAR_OBJETIVO":
-            objetivo = datos.get("OBJETIVO") or texto_usuario
+            objetivo = datos["OBJETIVO"] if "OBJETIVO" in datos else texto_usuario
             ok, texto_item = await _marcar_como_hecho("objetivo", objetivo)
             if ok:
                 await mensaje_espera.edit_text(f"Objetivo marcado como logrado: {texto_item}")
@@ -1506,7 +1548,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if accion == "COMPLETAR_UNI":
-            objetivo = datos.get("OBJETIVO") or texto_usuario
+            objetivo = datos["OBJETIVO"] if "OBJETIVO" in datos else texto_usuario
             ok, texto_item = await _marcar_como_hecho("uni", objetivo)
             if ok:
                 await mensaje_espera.edit_text(f"Universidad marcada como realizada: {texto_item}")
