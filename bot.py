@@ -1,4 +1,4 @@
-import datetime
+﻿import datetime
 from scheduler import job_reporte_diario, job_nudge_objetivos
 import logging
 import random
@@ -61,7 +61,7 @@ HELP_ACTIONS = {
 
 
 def _extraer_campos(texto: str, clave: str) -> Optional[str]:
-    match = re.search(rf"{clave}:\s*(.+)", texto, flags=re.IGNORECASE)
+    match = re.search(rf"(?mi)^\s*{re.escape(clave)}\s*:\s*(.+?)\s*$", texto)
     return match.group(1).strip() if match else None
 
 
@@ -119,13 +119,13 @@ def _parse_fecha_cruda(valor: str) -> Optional[tuple[str, bool]]:
 
 def _normalizar_texto_base(texto: str) -> str:
     reemplazos = {
-        "á": "a",
-        "é": "e",
-        "í": "i",
-        "ó": "o",
-        "ú": "u",
-        "ñ": "n",
-        "¿": "",
+        "Ã¡": "a",
+        "Ã©": "e",
+        "Ã­": "i",
+        "Ã³": "o",
+        "Ãº": "u",
+        "Ã±": "n",
+        "Â¿": "",
         "?": "",
     }
     out = texto.lower()
@@ -181,6 +181,68 @@ def _extraer_texto_y_fecha(contenido: str) -> tuple[str, Optional[str], bool]:
     return contenido.strip(), None, False
 
 
+def _extraer_texto_entre_comillas(texto: str) -> Optional[str]:
+    # Soporta comillas dobles, simples y tipograficas.
+    patrones = [
+        r'"([^"]+)"',
+        r"'([^']+)'",
+        r"“([^”]+)”",
+        r"‘([^’]+)’",
+    ]
+    for p in patrones:
+        m = re.search(p, texto)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
+def _normalizar_texto_tarea_input(texto: str) -> str:
+    t = (texto or "").strip()
+    if not t:
+        return t
+
+    quoted = _extraer_texto_entre_comillas(t)
+    if quoted:
+        return quoted
+
+    # Limpia comandos conversacionales comunes para quedarnos con la accion esencial.
+    t = re.sub(
+        r"^(anota(?:me)?|agrega(?:me)?|guarda(?:me)?|recorda(?:me)?|recordame)\s+",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(
+        r"^(como\s+)?(una\s+)?tarea(\s+pendiente)?\s*[:\-]?\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(
+        r"^(que\s+)?tarea\s+pendiente\s*[:\-]?\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"\b(hoy|mañana|manana)\s+a\s+la?s?\s+\d{1,2}(?::\d{2})?\s*hs?\b", "", t, flags=re.IGNORECASE)
+    return t.strip().strip("\"'").strip()
+
+
+def _extraer_fecha_relativa_simple(texto: str) -> Optional[str]:
+    low = (texto or "").lower()
+    m = re.search(r"\b(hoy|mañana|manana)\s+a\s+la?s?\s+(\d{1,2})(?::(\d{2}))?\s*hs?\b", low, flags=re.IGNORECASE)
+    if not m:
+        return None
+    dia_token = m.group(1)
+    hour = int(m.group(2))
+    minute = int(m.group(3) or "0")
+    base = datetime.datetime.now(TIMEZONE)
+    if dia_token in ("mañana", "manana"):
+        base = base + datetime.timedelta(days=1)
+    dt = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return dt.isoformat()
+
+
 def _extraer_fecha_desde_datos_llm(datos: Dict[str, Any]) -> Optional[str]:
     for clave in ("INICIO", "FIN"):
         valor = str(datos.get(clave, "")).strip()
@@ -219,7 +281,7 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
         x in low
         for x in (
             "que tareas tengo",
-            "qué tareas tengo",
+            "quÃ© tareas tengo",
             "leer tareas",
             "ver tareas",
             "mostrar tareas",
@@ -233,6 +295,12 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
 
     if _parece_consulta_universidad(low):
         return "LEER_UNI", {}
+
+    if re.search(
+        r"^(anota(?:me)?|agrega(?:me)?|guarda(?:me)?|recorda(?:me)?|recordame)\b.*\btarea\s+pendiente\b",
+        low,
+    ):
+        return "NUEVA_TAREA", {"TEXTO": raw}
 
     # Objetivo de largo plazo/frase natural.
     if re.search(r"\bmi\s+objetivo\b", low) or re.search(r"\bobjetivo\s+de\s+este\s+mes\b", low):
@@ -264,7 +332,7 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
     if (
         "semana que viene" in low
         or "proxima semana" in low
-        or re.search(r"\b(para|el)\s+(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b", low)
+        or re.search(r"\b(para|el)\s+(lunes|martes|miercoles|miÃ©rcoles|jueves|viernes|sabado|sÃ¡bado|domingo)\b", low)
     ) and not any(x in low for x in ("entrega", "examen", "parcial", "final")) and not any(x in low for x in ("leer uni", "leer universidad", "ver uni", "ver universidad", "mostrar uni", "mostrar universidad")):
         if any(x in low for x in ("leer ", "estudiar ", "repasar ", "hacer ", "rendir ", "preparar ")):
             return "NUEVA_TAREA", {"TEXTO": raw}
@@ -372,8 +440,8 @@ def _parsear_bloque_router(texto: str) -> tuple[str, Dict[str, Any]]:
 
     accion = (_extraer_campos(bloque, "ACCION") or "DESCONOCIDO").upper()
     if accion == "DESCONOCIDO":
-        # Fallback para respuestas libres tipo "Acción: NUEVA_TAREA"
-        m_accion = re.search(r"\bacci[oó]n\s*:\s*([A-Z_]+)\b", bloque, flags=re.IGNORECASE)
+        # Fallback para respuestas libres tipo "AcciÃ³n: NUEVA_TAREA"
+        m_accion = re.search(r"\bacci[oÃ³]n\s*:\s*([A-Z_]+)\b", bloque, flags=re.IGNORECASE)
         if m_accion:
             accion = m_accion.group(1).upper()
 
@@ -424,6 +492,14 @@ def _parsear_bloque_router(texto: str) -> tuple[str, Dict[str, Any]]:
             datos["INICIO"] = m_inicio.group(1).strip()
 
     if accion == "DESCONOCIDO":
+        upper_text = re.sub(r"\s+", " ", texto.upper())
+        # Evita eco del system prompt y basura del router.
+        if (
+            "ROUTER DE COMANDOS SIN PERSONALIDAD" in upper_text
+            or "REGLAS DE ORO" in upper_text
+            or "RESPONDE UNICAMENTE CON EL BLOQUE" in upper_text
+        ):
+            return "DESCONOCIDO", {}
         return "DESCONOCIDO", {"RESPUESTA": texto.strip()}
     return accion, datos
 
@@ -439,12 +515,19 @@ def _extraer_evento_desde_texto_usuario(texto: str) -> str:
 
 def _parece_intencion_borrar(texto: str) -> bool:
     low = texto.lower()
-    return any(k in low for k in ("cancelar", "cancelame", "cancelá", "cancela", "borrar", "borra", "eliminar", "elimina"))
+    return any(k in low for k in ("cancelar", "cancelame", "cancelÃ¡", "cancela", "borrar", "borra", "eliminar", "elimina"))
 
 
 
 def _parece_borrado_masivo_tareas(texto: str) -> bool:
     low = texto.lower()
+    if "evento" in low:
+        return False
+    if re.search(
+        r"\b(elimina(?:me)?|borrar(?:me)?|borra(?:me)?|limpia(?:me)?|completa(?:me)?|completar|marca(?:me)?)\b.*\btarea\w*\b",
+        low,
+    ):
+        return True
     patrones = (
         "borra todas las tareas",
         "borrar todas las tareas",
@@ -530,8 +613,10 @@ async def obtener_comando_ia(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
     accion, datos = ("DESCONOCIDO", {})
     respuesta_libre_llm: Optional[str] = None
 
-    if _parece_borrado_masivo_tareas(texto_usuario):
-        return "COMPLETAR_TODAS_TAREAS", {}
+    # Reglas locales prioritarias para comandos de mantenimiento (sin pasar por LLM).
+    accion_local_directa, datos_local_directos = _parsear_comando_local(texto_usuario)
+    if accion_local_directa == "COMPLETAR_TODAS_TAREAS":
+        return accion_local_directa, datos_local_directos
 
     accion_llm, datos_llm = await _interpretar_con_ollama(texto_usuario)
     _debug_router(f"accion_llm={accion_llm} datos_llm={datos_llm}")
@@ -1307,8 +1392,11 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if accion == "NUEVA_TAREA":
             texto, fecha_iso, _all_day = _extraer_texto_y_fecha(datos.get("TEXTO") or texto_usuario)
+            texto = _normalizar_texto_tarea_input(texto)
             if not fecha_iso:
                 fecha_iso = _extraer_fecha_desde_datos_llm(datos)
+            if not fecha_iso:
+                fecha_iso = _extraer_fecha_relativa_simple(datos.get("TEXTO") or texto_usuario)
             if not texto:
                 await mensaje_espera.edit_text("Necesito el texto de la tarea.")
                 return
@@ -1405,7 +1493,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ok:
                 await mensaje_espera.edit_text(f"Tarea marcada como completada: {texto_item}")
             else:
-                await mensaje_espera.edit_text("No encontré esa tarea para marcarla como hecha.")
+                await mensaje_espera.edit_text("No encontrÃ© esa tarea para marcarla como hecha.")
             return
 
         if accion == "COMPLETAR_OBJETIVO":
@@ -1414,7 +1502,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ok:
                 await mensaje_espera.edit_text(f"Objetivo marcado como logrado: {texto_item}")
             else:
-                await mensaje_espera.edit_text("No encontré ese objetivo para marcarlo como logrado.")
+                await mensaje_espera.edit_text("No encontrÃ© ese objetivo para marcarlo como logrado.")
             return
 
         if accion == "COMPLETAR_UNI":
@@ -1423,7 +1511,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ok:
                 await mensaje_espera.edit_text(f"Universidad marcada como realizada: {texto_item}")
             else:
-                await mensaje_espera.edit_text("No encontré ese item de universidad para marcarlo como realizado.")
+                await mensaje_espera.edit_text("No encontrÃ© ese item de universidad para marcarlo como realizado.")
             return
 
         if "tarea" in texto_usuario.lower():
@@ -1468,7 +1556,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await mensaje_espera.edit_text("Objetivo guardado en Life OS. Guardado como objetivo.")
                 return
 
-        if re.search(r"\b(que tengo|qué tengo|pendiente|pendientes|leer uni|leer universidad|ver uni|ver universidad|mostrar uni|mostrar universidad)\b", texto_usuario.lower()):
+        if re.search(r"\b(que tengo|quÃ© tengo|pendiente|pendientes|leer uni|leer universidad|ver uni|ver universidad|mostrar uni|mostrar universidad)\b", texto_usuario.lower()):
             universidad = await listar_universidad(solo_activas=True)
             if universidad:
                 item = universidad[0]
@@ -1521,7 +1609,7 @@ def main():
     app.add_error_handler(error_handler)
 
     # === MOTOR PROACTIVO (SCHEDULER) ===
-    hora_reporte = datetime.time(hour=8, minute=0, tzinfo=TIMEZONE)
+    hora_reporte = datetime.time(hour=10, minute=0, tzinfo=TIMEZONE)
     app.job_queue.run_daily(job_reporte_diario, time=hora_reporte)
 
     hora_nudge = datetime.time(hour=16, minute=30, tzinfo=TIMEZONE)
@@ -1539,4 +1627,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
