@@ -20,11 +20,14 @@ from database import (
     cambiar_estado_tarea_suelta,
     cambiar_estado_universidad,
     completar_todas_tareas_pendientes,
+    completar_toda_universidad_pendiente,
+    completar_todos_objetivos_activos,
     init_db,
     listar_objetivos_proyectos,
     listar_tareas_sueltas,
     listar_universidad,
     snapshot_pendientes,
+    snapshot_por_rango,
     universidad_random_activa,
     vincular_objetivo_proyecto,
     vincular_tarea_suelta,
@@ -57,6 +60,11 @@ HELP_ACTIONS = {
     "help_leer_uni": "leer uni",
     "help_evento": "crear evento reunion | 17/03/26 10:00 | 17/03/26 11:00",
     "help_borrar": "borrar evento reunion",
+    "help_hoy": "que tengo hoy",
+    "help_manana": "que tengo mañana",
+    "help_done_all_tasks": "completa todas las tareas pendientes",
+    "help_done_all_uni": "completa toda la universidad pendiente",
+    "help_done_all_obj": "completa todos los objetivos",
 }
 
 
@@ -269,10 +277,19 @@ def _normalizar_evento_intervalo(inicio_raw: str, fin_raw: str) -> tuple[Optiona
 
 def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
     raw = texto.strip()
-    low = raw.lower()
+    low = _normalizar_texto_base(raw)
 
     if _parece_borrado_masivo_tareas(low):
         return "COMPLETAR_TODAS_TAREAS", {}
+
+    if _parece_borrado_masivo_universidad(low):
+        return "COMPLETAR_TODA_UNI", {}
+
+    if _parece_borrado_masivo_objetivos(low):
+        return "COMPLETAR_TODOS_OBJETIVOS", {}
+
+    if _parece_consulta_hoy_manana(low):
+        return "LEER_DIA", {"DIA": "MANANA" if _incluye_manana(low) else "HOY"}
 
     if any(x in low for x in ("leer lo pendiente", "leer pendientes", "leer db", "ver pendientes", "mostrar pendientes")):
         return "LEER_DB", {}
@@ -295,6 +312,10 @@ def _parsear_comando_local(texto: str) -> Tuple[str, Dict[str, Any]]:
 
     if _parece_consulta_universidad(low):
         return "LEER_UNI", {}
+
+    # Frase coloquial frecuente: "hoy toca ..." => tarea suelta.
+    if re.search(r"\b(hoy|manana)\s+toca\b", low):
+        return "NUEVA_TAREA", {"TEXTO": raw}
 
     # Comandos de completado en lenguaje natural (prefix): completar/completame X
     m_complete_prefix = re.match(
@@ -549,13 +570,13 @@ def _extraer_evento_desde_texto_usuario(texto: str) -> str:
 
 
 def _parece_intencion_borrar(texto: str) -> bool:
-    low = texto.lower()
-    return any(k in low for k in ("cancelar", "cancelame", "cancelÃ¡", "cancela", "borrar", "borra", "eliminar", "elimina"))
+    low = _normalizar_texto_base(texto)
+    return any(k in low for k in ("cancelar", "cancelame", "cancela", "borrar", "borra", "eliminar", "elimina"))
 
 
 
 def _parece_borrado_masivo_tareas(texto: str) -> bool:
-    low = texto.lower()
+    low = _normalizar_texto_base(texto)
     if "evento" in low:
         return False
     if re.search(r"\b(elimina(?:me)?|borrar(?:me)?|borra(?:me)?|limpia(?:me)?|completa(?:me)?|completar|marca(?:me)?)\b", low) and re.search(r"\btarea\w*\b", low):
@@ -583,8 +604,36 @@ def _parece_borrado_masivo_tareas(texto: str) -> bool:
     return any(p in low for p in patrones)
 
 
+def _parece_borrado_masivo_universidad(texto: str) -> bool:
+    low = _normalizar_texto_base(texto)
+    return bool(
+        re.search(r"\b(completa(?:me)?|elimina(?:me)?|borra(?:me)?|limpia(?:me)?)\b.*\b(universidad|uni|facultad|facu)\b", low)
+        and any(k in low for k in ("toda", "todas", "pendiente", "pendientes"))
+    )
+
+
+def _parece_borrado_masivo_objetivos(texto: str) -> bool:
+    low = _normalizar_texto_base(texto)
+    return bool(
+        re.search(r"\b(completa(?:me)?|elimina(?:me)?|borra(?:me)?|limpia(?:me)?)\b.*\b(objetivo|objetivos|metas|proyectos)\b", low)
+        and any(k in low for k in ("todo", "todos", "pendiente", "pendientes", "activos"))
+    )
+
+
+def _incluye_manana(low: str) -> bool:
+    normalizado = _normalizar_texto_base(low)
+    return "manana" in normalizado or "maana" in normalizado
+
+
+def _parece_consulta_hoy_manana(low: str) -> bool:
+    normalizado = _normalizar_texto_base(low)
+    if not any(k in normalizado for k in ("hoy", "manana", "maana")):
+        return False
+    return any(k in normalizado for k in ("que tengo", "que hay", "pendiente", "pendientes", "tengo"))
+
+
 def _intencion_explicita_para_accion(texto: str, accion: str) -> bool:
-    low = texto.lower()
+    low = _normalizar_texto_base(texto)
     reglas: dict[str, tuple[str, ...]] = {
         "BORRAR": ("cancelar", "cancelame", "cancela", "borrar", "borra", "eliminar", "elimina"),
         "CREAR": ("crear evento", "agendar evento", "programar evento"),
@@ -607,6 +656,18 @@ def _intencion_explicita_para_accion(texto: str, accion: str) -> bool:
             "eliminar tareas pendientes",
             "completar todas las tareas",
         ),
+        "COMPLETAR_TODA_UNI": (
+            "completa toda la universidad",
+            "completa toda la uni",
+            "elimina universidad pendiente",
+            "limpia universidad pendiente",
+        ),
+        "COMPLETAR_TODOS_OBJETIVOS": (
+            "completa todos los objetivos",
+            "completa todos los proyectos",
+            "limpia objetivos activos",
+        ),
+        "LEER_DIA": ("que tengo hoy", "que tengo mañana", "qué tengo hoy", "qué tengo mañana", "pendientes de hoy", "pendientes de mañana"),
     }
     kws = reglas.get(accion, ())
     return any(k in low for k in kws)
@@ -651,7 +712,12 @@ async def obtener_comando_ia(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
 
     # Reglas locales prioritarias para comandos de mantenimiento (sin pasar por LLM).
     accion_local_directa, datos_local_directos = _parsear_comando_local(texto_usuario)
-    if accion_local_directa == "COMPLETAR_TODAS_TAREAS":
+    if accion_local_directa in (
+        "COMPLETAR_TODAS_TAREAS",
+        "COMPLETAR_TODA_UNI",
+        "COMPLETAR_TODOS_OBJETIVOS",
+        "LEER_DIA",
+    ):
         return accion_local_directa, datos_local_directos
 
     accion_llm, datos_llm = await _interpretar_con_ollama(texto_usuario)
@@ -697,6 +763,49 @@ async def obtener_comando_ia(texto_usuario: str) -> tuple[str, Dict[str, Any]]:
 
     _debug_router(f"accion_final={accion} datos_final={datos}")
     return accion, datos
+
+
+def _rango_dia(dia: str) -> tuple[str, str]:
+    now = datetime.datetime.now(TIMEZONE)
+    base = now
+    if dia.upper() == "MANANA":
+        base = now + datetime.timedelta(days=1)
+    inicio = base.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    fin = base.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+    return inicio, fin
+
+
+async def _resumen_hoy_manana(dia: str) -> str:
+    inicio, fin = _rango_dia(dia)
+    eventos = list_events(inicio, fin)
+    snap = await snapshot_por_rango(inicio, fin)
+    titulo = "mañana" if dia.upper() == "MANANA" else "hoy"
+    lines = [f"Resumen para {titulo}:", ""]
+    lines.append("Calendar:")
+    if eventos:
+        for ev in eventos[:10]:
+            inicio_ev = ev["start"].get("dateTime", ev["start"].get("date"))
+            fecha_legible = _formatear_fecha_amigable(inicio_ev)
+            prefijo = "[IUA]" if ev.get("_calendar_id") == ID_SEGUNDO_CALENDARIO else "[CAL]"
+            lines.append(f"- {prefijo} {ev.get('summary','Sin titulo')} ({fecha_legible})")
+    else:
+        lines.append("- Sin eventos.")
+    lines.append("")
+    lines.append("Life OS:")
+    any_items = False
+    for t in snap["tareas_sueltas"][:10]:
+        any_items = True
+        lines.append(f"- Tarea: {_title_case_texto(t.get('texto',''))}")
+    for o in snap["objetivos_proyectos"][:10]:
+        any_items = True
+        lines.append(f"- Objetivo: {_title_case_texto(o.get('descripcion',''))}")
+    for u in snap["universidad"][:10]:
+        any_items = True
+        mat = f" - {_title_case_texto(u.get('materia',''))}" if u.get("materia") else ""
+        lines.append(f"- Uni: {_title_case_texto(u.get('titulo',''))}{mat}")
+    if not any_items:
+        lines.append("- Sin pendientes fechados.")
+    return "\n".join(lines)
 
 
 def _prioridad_score_item(tipo: str, item: dict[str, Any]) -> tuple[int, int, str]:
@@ -853,10 +962,17 @@ def _help_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("Leer DB", callback_data="help_leer"),
             InlineKeyboardButton("Leer Uni", callback_data="help_leer_uni"),
+            InlineKeyboardButton("Hoy", callback_data="help_hoy"),
+            InlineKeyboardButton("Mañana", callback_data="help_manana"),
         ],
         [
             InlineKeyboardButton("Evento", callback_data="help_evento"),
             InlineKeyboardButton("Borrar", callback_data="help_borrar"),
+        ],
+        [
+            InlineKeyboardButton("Completar tareas", callback_data="help_done_all_tasks"),
+            InlineKeyboardButton("Completar uni", callback_data="help_done_all_uni"),
+            InlineKeyboardButton("Completar objetivos", callback_data="help_done_all_obj"),
         ],
     ]
     return InlineKeyboardMarkup(rows)
@@ -1333,6 +1449,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Hola Augusto. El Life OS local ya esta listo.")
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pendientes = await snapshot_pendientes()
+    tareas = len(pendientes["tareas_sueltas"])
+    objetivos = len(pendientes["objetivos_proyectos"])
+    uni = len(pendientes["universidad"])
+    msg = (
+        "Estado del Life OS:\n"
+        f"- Tareas pendientes: {tareas}\n"
+        f"- Objetivos activos: {objetivos}\n"
+        f"- Universidad pendiente: {uni}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def hoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await _resumen_hoy_manana("HOY"))
+
+
+async def manana_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await _resumen_hoy_manana("MANANA"))
+
+
 async def resumen_diario(context: ContextTypes.DEFAULT_TYPE):
     if not MI_CHAT_ID:
         return
@@ -1414,6 +1552,22 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await mensaje_espera.edit_text("No habia tareas pendientes para limpiar.")
             else:
                 await mensaje_espera.edit_text(f"Listo. Marque {cantidad} tarea(s) como completada(s).")
+            return
+
+        if accion == "COMPLETAR_TODA_UNI":
+            cantidad = await completar_toda_universidad_pendiente()
+            if cantidad == 0:
+                await mensaje_espera.edit_text("No habia items de universidad pendientes.")
+            else:
+                await mensaje_espera.edit_text(f"Listo. Marque {cantidad} item(s) de universidad como realizado(s).")
+            return
+
+        if accion == "COMPLETAR_TODOS_OBJETIVOS":
+            cantidad = await completar_todos_objetivos_activos()
+            if cantidad == 0:
+                await mensaje_espera.edit_text("No habia objetivos activos para completar.")
+            else:
+                await mensaje_espera.edit_text(f"Listo. Marque {cantidad} objetivo(s) como logrado(s).")
             return
 
         if accion == "BORRAR":
@@ -1527,6 +1681,11 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 lineas.append("")
             await mensaje_espera.edit_text("\n".join(lineas).strip())
+            return
+
+        if accion == "LEER_DIA":
+            dia = str(datos.get("DIA", "HOY")).upper()
+            await mensaje_espera.edit_text(await _resumen_hoy_manana(dia))
             return
 
         if accion == "COMPLETAR_TAREA":
@@ -1646,6 +1805,9 @@ def main():
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("hoy", hoy_command))
+    app.add_handler(CommandHandler("manana", manana_command))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje))
     app.add_error_handler(error_handler)

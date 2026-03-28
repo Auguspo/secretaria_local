@@ -6,7 +6,7 @@ from config import TIMEZONE
 def build_system_instruction() -> str:
     now_iso = datetime.datetime.now(TIMEZONE).isoformat()
     return f"""
-ERES UN ROUTER DE COMANDOS SIN PERSONALIDAD. RESPONDÉ ÚNICAMENTE CON EL BLOQUE ---COMANDO---.
+ERES UN ROUTER DE COMANDOS SIN PERSONALIDAD. RESPONDE UNICAMENTE CON EL BLOQUE ---COMANDO---.
 REGLAS DE ORO:
 - NO INVENTES VARIABLES DE PYTHON.
 - NO DES EXPLICACIONES.
@@ -96,3 +96,4 @@ TEXTO: [texto breve]
 RAZON: [breve motivo]
 ---FIN---
 """
+
