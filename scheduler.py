@@ -230,14 +230,23 @@ def _armar_reporte_diario(
 
     lines.append("")
     lines.append("Tareas pendientes:")
-    if tareas_pendientes:
-        for t in tareas_pendientes[:10]:
+    tareas_con_fecha = [t for t in tareas_pendientes if t.get("fecha_evento")]
+    tareas_sin_fecha = [t for t in tareas_pendientes if not t.get("fecha_evento")]
+    if tareas_con_fecha:
+        for t in tareas_con_fecha[:10]:
             texto = str(t.get("texto", "")).strip() or "Sin descripcion"
             dt = _parse_iso_suave(t.get("fecha_evento"))
             fecha_txt = f" | {_fmt_fecha(dt)}" if dt else ""
             lines.append(f"- {texto}{fecha_txt}")
     else:
-        lines.append("- Sin tareas pendientes.")
+        lines.append("- Sin tareas con fecha.")
+
+    if tareas_sin_fecha:
+        lines.append("")
+        lines.append("Backlog sin fecha:")
+        for t in tareas_sin_fecha[:5]:
+            texto = str(t.get("texto", "")).strip() or "Sin descripcion"
+            lines.append(f"- {texto}")
 
     lines.append("")
     lines.append("Clases de hoy:")

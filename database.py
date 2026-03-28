@@ -66,6 +66,9 @@ async def init_db() -> None:
         await _ensure_column(db, "universidad", "fecha_evento", "TEXT")
         await _ensure_column(db, "universidad", "estado", "TEXT NOT NULL DEFAULT 'Pendiente'")
         await _ensure_column(db, "universidad", "calendar_event_id", "TEXT")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tareas_estado_fecha ON tareas_sueltas(estado, fecha_evento)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_obj_estado_fecha ON objetivos_proyectos(estado, fecha_evento)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_uni_estado_fecha ON universidad(estado, fecha_evento)")
         await db.commit()
 
 
@@ -130,6 +133,26 @@ async def completar_todas_tareas_pendientes() -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "UPDATE tareas_sueltas SET estado = 'Completada' WHERE estado = 'Pendiente'"
+        )
+        await db.commit()
+        return int(cursor.rowcount or 0)
+
+
+async def completar_todos_objetivos_activos() -> int:
+    await init_db()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE objetivos_proyectos SET estado = 'Logrado' WHERE estado = 'Activo'"
+        )
+        await db.commit()
+        return int(cursor.rowcount or 0)
+
+
+async def completar_toda_universidad_pendiente() -> int:
+    await init_db()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE universidad SET estado = 'Realizado' WHERE estado = 'Pendiente'"
         )
         await db.commit()
         return int(cursor.rowcount or 0)
@@ -347,4 +370,23 @@ async def snapshot_pendientes() -> dict[str, list[dict[str, Any]]]:
         "tareas_sueltas": await listar_tareas_sueltas(solo_activas=True),
         "objetivos_proyectos": await listar_objetivos_proyectos(solo_activos=True),
         "universidad": await listar_universidad(solo_activas=True),
+    }
+
+
+async def snapshot_por_rango(inicio_iso: str, fin_iso: str) -> dict[str, list[dict[str, Any]]]:
+    """Pendientes con fecha dentro de un rango [inicio, fin]."""
+    pendientes = await snapshot_pendientes()
+
+    def _in_range(fecha_raw: Optional[str]) -> bool:
+        if not fecha_raw:
+            return False
+        inicio = inicio_iso.replace("Z", "+00:00")
+        fin = fin_iso.replace("Z", "+00:00")
+        fecha = str(fecha_raw).replace("Z", "+00:00")
+        return inicio <= fecha <= fin
+
+    return {
+        "tareas_sueltas": [t for t in pendientes["tareas_sueltas"] if _in_range(t.get("fecha_evento"))],
+        "objetivos_proyectos": [o for o in pendientes["objetivos_proyectos"] if _in_range(o.get("fecha_evento"))],
+        "universidad": [u for u in pendientes["universidad"] if _in_range(u.get("fecha_evento"))],
     }
